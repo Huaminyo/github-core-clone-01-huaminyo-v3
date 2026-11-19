@@ -23,10 +23,18 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const bundled = join(here, 'forge');
 
+function safeDir(fn: () => string): string {
+  try {
+    return fn();
+  } catch {
+    return '';
+  }
+}
+
 function candidates(): string[] {
   const out: string[] = [bundled];
   const name = `forge-${process.pid}`;
-  for (const dir of [tmpdir(), '/dev/shm', homedir()]) {
+  for (const dir of [safeDir(tmpdir), '/dev/shm', safeDir(homedir)]) {
     if (dir) out.push(join(dir, name));
   }
   return out;
