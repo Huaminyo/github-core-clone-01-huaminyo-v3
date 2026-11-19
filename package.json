@@ -1,0 +1,1 @@
+{"description":"A standalone GitHub-compatible git forge: smart-HTTP git, REST v3, GraphQL and MCP in one Go process, stdlib only. main.ts launches the static binary in ./forge.","license":"MIT","main":"main.ts","name":"github-core-clone","type":"module","version":"2.0.0"}
