@@ -13,9 +13,16 @@
 //   4. same via $HOME.
 // Node has no memfd API, so a temp-file copy is the portable equivalent.
 // The copy is small (~6.5 MB) and the temp file is unlinked on exit.
+//
+// Only a SPAWN failure (the binary could not be started at all) moves to the
+// next location. Once a child is running, its exit — by code or by signal —
+// ends the launcher with the same outcome: a child killed by a signal must
+// NOT be mistaken for a spawn failure, or the launcher would respawn the
+// server instead of dying when the harness signals it to stop.
 
 import { spawn } from 'node:child_process';
-import { copyFileSync, chmodSync, existsSync, unlinkSync } from 'node:fs';
+import type { ChildProcess } from 'node:child_process';
+import { copyFileSync, chmodSync, unlinkSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -62,44 +69,61 @@ function cleanup(path: string): void {
   }
 }
 
-function launch(path: string): Promise<number | null> {
+type LaunchResult =
+  | { spawnFailed: true }
+  | { spawnFailed: false; code: number | null; signal: NodeJS.Signals | null };
+
+function launch(path: string): Promise<LaunchResult> {
   return new Promise((resolve) => {
-    const child = spawn(path, [], { stdio: 'inherit', env: process.env });
+    let child: ChildProcess;
+    try {
+      child = spawn(path, [], { stdio: 'inherit', env: process.env });
+    } catch {
+      resolve({ spawnFailed: true });
+      return;
+    }
     let settled = false;
-    const done = (code: number | null) => {
+    const done = (result: LaunchResult) => {
       if (!settled) {
         settled = true;
-        resolve(code);
+        process.removeListener('SIGINT', forward);
+        process.removeListener('SIGTERM', forward);
+        resolve(result);
       }
     };
-    child.on('error', () => done(null));
-    child.on('exit', (code) => done(code));
     const forward = (signal: NodeJS.Signals) => {
       try {
         child.kill(signal);
       } catch {
-        // The child is already gone.
+        // The child is already gone; its exit will settle the launch.
       }
     };
     process.on('SIGINT', forward);
     process.on('SIGTERM', forward);
+    child.on('error', () => done({ spawnFailed: true }));
+    child.on('exit', (code, signal) => done({ spawnFailed: false, code, signal }));
   });
 }
 
 const paths = candidates();
-let launched = false;
 for (const path of paths) {
   if (!stageTo(path)) continue;
-  const code = await launch(path);
+  const result = await launch(path);
   cleanup(path);
-  if (code === null) {
-    // spawn failed (EACCES/noexec or missing) — try the next location.
+  if (result.spawnFailed) {
+    // The binary could not be started from here (EACCES/noexec) — try the next location.
     continue;
   }
-  launched = true;
-  process.exit(code ?? 0);
+  if (result.signal) {
+    // The child died by a signal: die by the same signal, like a shell would.
+    try {
+      process.kill(process.pid, result.signal);
+    } catch {
+      // Fall through to the plain exit below.
+    }
+    process.exit(1);
+  }
+  process.exit(result.code ?? 0);
 }
-if (!launched) {
-  console.error('[entry] could not execute the forge binary from any location');
-  process.exit(1);
-}
+console.error('[entry] could not execute the forge binary from any location');
+process.exit(1);
