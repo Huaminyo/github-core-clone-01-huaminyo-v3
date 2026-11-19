@@ -22,6 +22,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"io"
@@ -32,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -66,11 +68,20 @@ type httpResponse struct {
 }
 
 // app is the server: the forge, the lock, auth, and the request counter.
+//
+// The lock is an RWMutex: read-only requests (GET/HEAD, plus POST
+// git-upload-pack, which only ever reads) run concurrently under a read
+// lock, while mutations take the write lock. That matters for the clone
+// workload: 50 concurrent clones used to serialize on one mutex. Reads
+// never mutate store state: the response caches are sync.Maps and the
+// deterministic sequence only advances on mutations (write-locked), so
+// concurrent reads see a consistent store and the exported state stays
+// a pure function of the (sequential) mutation order.
 type app struct {
 	forge          *Forge
-	mu             sync.Mutex
+	mu             sync.RWMutex
 	expectedToken  string
-	requestCounter int
+	requestCounter atomic.Int64
 }
 
 func newApp() *app {
@@ -109,24 +120,34 @@ func (a *app) handleConn(conn net.Conn) {
 // readRequest parses one request from the connection. It returns the request,
 // whether the connection stays alive after the response, and an error when
 // the connection is unusable.
+//
+// The hot path allocates as little as possible: header lines are parsed
+// in place from the reader's buffer (readLine aliases it) and only the
+// values the request keeps become strings; headers the server ignores
+// (accept, user-agent, ...) cost no allocation at all.
 func readRequest(reader *bufio.Reader, conn net.Conn) (*httpRequest, bool, error) {
 	line, err := readLine(reader)
 	if err != nil {
 		return nil, false, err
 	}
-	if line == "" {
+	if len(line) == 0 {
 		// A stray blank line before a request (a client probe): skip it.
 		line, err = readLine(reader)
 		if err != nil {
 			return nil, false, err
 		}
 	}
-	parts := strings.SplitN(line, " ", 3)
-	if len(parts) != 3 {
+	sp1 := bytes.IndexByte(line, ' ')
+	if sp1 < 0 {
 		return nil, false, errors.New("malformed request line")
 	}
-	req := &httpRequest{method: parts[0], rawURL: parts[1]}
-	req.version11 = parts[2] == "HTTP/1.1"
+	sp2 := bytes.IndexByte(line[sp1+1:], ' ')
+	if sp2 < 0 {
+		return nil, false, errors.New("malformed request line")
+	}
+	sp2 += sp1 + 1
+	req := &httpRequest{method: string(line[:sp1]), rawURL: string(line[sp1+1 : sp2])}
+	req.version11 = bytes.Equal(line[sp2+1:], http11Bytes)
 	headerBytes := len(line)
 	for {
 		hdr, err := readLine(reader)
@@ -137,35 +158,35 @@ func readRequest(reader *bufio.Reader, conn net.Conn) (*httpRequest, bool, error
 		if headerBytes > maxHeaderBytes {
 			return nil, false, errors.New("headers too large")
 		}
-		if hdr == "" {
+		if len(hdr) == 0 {
 			break
 		}
-		colon := strings.IndexByte(hdr, ':')
+		colon := bytes.IndexByte(hdr, ':')
 		if colon < 0 {
 			continue
 		}
-		name := strings.ToLower(strings.TrimSpace(hdr[:colon]))
-		value := strings.TrimSpace(hdr[colon+1:])
-		switch name {
-		case "host":
-			req.host = value
-		case "authorization":
-			req.authorization = value
-		case "git-protocol":
-			req.gitProtocol = value
-		case "connection":
-			req.connection = value
-		case "expect":
-			if strings.EqualFold(value, "100-continue") {
+		name := trimSpaceBytes(hdr[:colon])
+		value := trimSpaceBytes(hdr[colon+1:])
+		switch {
+		case eqFoldASCII(name, hdrHost):
+			req.host = string(value)
+		case eqFoldASCII(name, hdrAuthorization):
+			req.authorization = string(value)
+		case eqFoldASCII(name, hdrGitProtocol):
+			req.gitProtocol = string(value)
+		case eqFoldASCII(name, hdrConnection):
+			req.connection = string(value)
+		case eqFoldASCII(name, hdrExpect):
+			if eqFoldASCII(value, expectContinue) {
 				req.expect100 = true
 			}
-		case "content-length":
-			if n, err := strconv.ParseInt(value, 10, 64); err == nil && n >= 0 {
-				req.contentLength = n
+		case eqFoldASCII(name, hdrContentLength):
+			if n, ok := parseUintBytes(value); ok {
+				req.contentLength = int64(n)
 				req.hasContentLength = true
 			}
-		case "transfer-encoding":
-			if strings.Contains(strings.ToLower(value), "chunked") {
+		case eqFoldASCII(name, hdrTransferEncoding):
+			if containsFoldASCII(value, chunkedBytes) {
 				req.chunked = true
 			}
 		}
@@ -174,9 +195,9 @@ func readRequest(reader *bufio.Reader, conn net.Conn) (*httpRequest, bool, error
 		req.host = "127.0.0.1"
 	}
 	keepAlive := req.version11
-	if strings.Contains(strings.ToLower(req.connection), "close") {
+	if containsFoldASCIIString(req.connection, closeBytes) {
 		keepAlive = false
-	} else if !req.version11 && strings.Contains(strings.ToLower(req.connection), "keep-alive") {
+	} else if !req.version11 && containsFoldASCIIString(req.connection, keepAliveBytes) {
 		keepAlive = true
 	}
 	// Read the body.
@@ -204,14 +225,137 @@ func readRequest(reader *bufio.Reader, conn net.Conn) (*httpRequest, bool, error
 	return req, keepAlive, nil
 }
 
-// readLine reads one CRLF- or LF-terminated line, without the terminator.
-func readLine(reader *bufio.Reader) (string, error) {
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		return "", err
+// Header names and tokens the request parser matches, as byte slices so
+// the comparisons allocate nothing. All lowercase: matching folds ASCII.
+var (
+	http11Bytes         = []byte("HTTP/1.1")
+	hdrHost             = []byte("host")
+	hdrAuthorization    = []byte("authorization")
+	hdrGitProtocol      = []byte("git-protocol")
+	hdrConnection       = []byte("connection")
+	hdrExpect           = []byte("expect")
+	hdrContentLength    = []byte("content-length")
+	hdrTransferEncoding = []byte("transfer-encoding")
+	expectContinue      = []byte("100-continue")
+	chunkedBytes        = []byte("chunked")
+	closeBytes          = []byte("close")
+	keepAliveBytes      = []byte("keep-alive")
+)
+
+func lowerByte(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + ('a' - 'A')
 	}
-	line = strings.TrimSuffix(line, "\n")
-	line = strings.TrimSuffix(line, "\r")
+	return c
+}
+
+// eqFoldASCII reports whether a equals b, folding ASCII case. b must already
+// be lowercase.
+func eqFoldASCII(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if lowerByte(a[i]) != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// containsFoldASCII reports whether hay contains needle, folding ASCII case.
+// needle must already be lowercase.
+func containsFoldASCII(hay, needle []byte) bool {
+	if len(needle) == 0 {
+		return true
+	}
+	for i := 0; i+len(needle) <= len(hay); i++ {
+		match := true
+		for j := range needle {
+			if lowerByte(hay[i+j]) != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// containsFoldASCIIString is containsFoldASCII for a string haystack.
+func containsFoldASCIIString(hay string, needle []byte) bool {
+	if len(needle) == 0 {
+		return true
+	}
+	for i := 0; i+len(needle) <= len(hay); i++ {
+		match := true
+		for j := range needle {
+			if lowerByte(hay[i+j]) != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// trimSpaceBytes trims ASCII spaces and tabs from both ends.
+func trimSpaceBytes(b []byte) []byte {
+	for len(b) > 0 && (b[0] == ' ' || b[0] == '\t') {
+		b = b[1:]
+	}
+	for len(b) > 0 && (b[len(b)-1] == ' ' || b[len(b)-1] == '\t') {
+		b = b[:len(b)-1]
+	}
+	return b
+}
+
+// parseUintBytes parses a non-negative decimal integer.
+func parseUintBytes(b []byte) (uint64, bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	var n uint64
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + uint64(c-'0')
+	}
+	return n, true
+}
+
+// readLine reads one CRLF- or LF-terminated line, without the terminator.
+// The returned slice aliases the reader's buffer: it is valid only until
+// the next read from the reader. Copy anything that must outlive it.
+func readLine(reader *bufio.Reader) ([]byte, error) {
+	line, err := reader.ReadSlice('\n')
+	if err == bufio.ErrBufferFull {
+		// Over-long line: accumulate fragments (rare; headers are short).
+		buf := append([]byte(nil), line...)
+		for err == bufio.ErrBufferFull {
+			var frag []byte
+			frag, err = reader.ReadSlice('\n')
+			buf = append(buf, frag...)
+		}
+		if err != nil {
+			return nil, err
+		}
+		line = buf
+	} else if err != nil {
+		return nil, err
+	}
+	if n := len(line); n > 0 && line[n-1] == '\n' {
+		line = line[:n-1]
+		if n := len(line); n > 0 && line[n-1] == '\r' {
+			line = line[:n-1]
+		}
+	}
 	return line, nil
 }
 
@@ -223,11 +367,11 @@ func readChunkedBody(reader *bufio.Reader) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if semi := strings.IndexByte(line, ';'); semi >= 0 {
+		if semi := bytes.IndexByte(line, ';'); semi >= 0 {
 			line = line[:semi]
 		}
-		size, err := strconv.ParseInt(strings.TrimSpace(line), 16, 64)
-		if err != nil || size < 0 {
+		size, ok := parseHexBytes(trimSpaceBytes(line))
+		if !ok {
 			return nil, errors.New("malformed chunk size")
 		}
 		if size == 0 {
@@ -237,13 +381,13 @@ func readChunkedBody(reader *bufio.Reader) ([]byte, error) {
 				if err != nil {
 					return nil, err
 				}
-				if trailer == "" {
+				if len(trailer) == 0 {
 					break
 				}
 			}
 			return body, nil
 		}
-		if int64(len(body))+size > maxBodyBytes {
+		if int64(len(body))+int64(size) > maxBodyBytes {
 			return nil, errors.New("request body too large")
 		}
 		chunk := make([]byte, size)
@@ -255,6 +399,29 @@ func readChunkedBody(reader *bufio.Reader) ([]byte, error) {
 			return nil, err
 		}
 	}
+}
+
+// parseHexBytes parses a non-negative hexadecimal integer.
+func parseHexBytes(b []byte) (uint64, bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	var n uint64
+	for _, c := range b {
+		var v uint64
+		switch {
+		case c >= '0' && c <= '9':
+			v = uint64(c - '0')
+		case c >= 'a' && c <= 'f':
+			v = uint64(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			v = uint64(c-'A') + 10
+		default:
+			return 0, false
+		}
+		n = n*16 + v
+	}
+	return n, true
 }
 
 var statusTexts = map[int]string{
@@ -315,10 +482,11 @@ type orderedParams struct {
 }
 
 func parseQueryParams(raw string) *orderedParams {
-	p := &orderedParams{values: map[string][]string{}}
+	p := &orderedParams{}
 	if raw == "" {
 		return p
 	}
+	p.values = map[string][]string{}
 	for _, pair := range strings.Split(raw, "&") {
 		if pair == "" {
 			continue
@@ -383,6 +551,9 @@ func (p *orderedParams) get(key string) (string, bool) {
 }
 
 func (p *orderedParams) set(key, value string) {
+	if p.values == nil {
+		p.values = map[string][]string{}
+	}
 	if _, ok := p.values[key]; !ok {
 		p.keys = append(p.keys, key)
 	}
@@ -598,28 +769,47 @@ func notFoundResponse(requestID string) httpResponse {
 
 var oauthScopesHeader = [2]string{"x-oauth-scopes", "repo, read:org"}
 
-// handle routes one request. It runs under the app mutex.
+// handle routes one request: read-only requests under a read lock,
+// everything else under the write lock. Misclassification must err
+// toward the write lock; a read-only path that took it would only be
+// slower, never wrong.
 func (a *app) handle(req *httpRequest) (resp httpResponse) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	if isReadOnlyRequest(req) {
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+	} else {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+	}
+	requestID := "req-" + itoa(int(a.requestCounter.Add(1)))
 	defer func() {
 		if r := recover(); r != nil {
 			if ge, ok := r.(*GitHTTPError); ok {
-				resp = jsonMessage(ge.Status, ge.Message, currentRequestID)
+				resp = jsonMessage(ge.Status, ge.Message, requestID)
 				return
 			}
-			resp = jsonMessage(500, "Internal server error", currentRequestID)
+			resp = jsonMessage(500, "Internal server error", requestID)
 		}
 	}()
-	a.requestCounter++
-	requestID := "req-" + itoa(a.requestCounter)
-	currentRequestID = requestID
 	return a.route(req, requestID)
 }
 
-// currentRequestID is the request id of the request being handled (only ever
-// read under the app mutex, in the panic handler above).
-var currentRequestID string
+// isReadOnlyRequest is true for GET/HEAD and for POST git-upload-pack
+// (ls-refs/fetch only read). Every other method, and every other POST
+// endpoint (receive-pack, REST writes, GraphQL, MCP), may mutate.
+func isReadOnlyRequest(req *httpRequest) bool {
+	if req.method == "GET" || req.method == "HEAD" {
+		return true
+	}
+	if req.method != "POST" {
+		return false
+	}
+	path := req.rawURL
+	if qAt := strings.IndexByte(path, '?'); qAt >= 0 {
+		path = path[:qAt]
+	}
+	return strings.HasSuffix(path, ".git/git-upload-pack")
+}
 
 func (a *app) isAuthorized(req *httpRequest) bool {
 	header := req.authorization

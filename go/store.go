@@ -1477,18 +1477,19 @@ type Repo struct {
 	NextNumber    int
 
 	// Caches, cleared by touch() on every mutation to this repo.
-	issueCache map[int][]byte
-	fetchCache map[string][]byte
-	lsCache    map[string][]byte
-	adCache    map[string][]byte
+	// sync.Map: reads populate them concurrently under a read lock.
+	issueCache sync.Map // int -> []byte
+	fetchCache sync.Map // string -> []byte
+	lsCache    sync.Map // string -> []byte
+	adCache    sync.Map // string -> []byte
 }
 
 // touch clears the repo's response caches. Call on every mutation.
 func (r *Repo) touch() {
-	r.issueCache = nil
-	r.fetchCache = nil
-	r.lsCache = nil
-	r.adCache = nil
+	r.issueCache.Clear()
+	r.fetchCache.Clear()
+	r.lsCache.Clear()
+	r.adCache.Clear()
 }
 
 // serverIdentity is the deterministic identity every server-created commit carries.
@@ -1496,15 +1497,15 @@ func serverIdentity() string {
 	return viewer.Name + " <" + viewer.Email + ">"
 }
 
-var isoCache = make(map[int]string)
+var isoCache sync.Map // int -> string
 
 // seqToISO is a deterministic ISO timestamp from a sequence number (never the wall clock).
 func seqToISO(seq int) string {
-	if cached, ok := isoCache[seq]; ok {
-		return cached
+	if cached, ok := isoCache.Load(seq); ok {
+		return cached.(string)
 	}
 	cached := time.Unix(scenarioEpochSec+int64(seq), 0).UTC().Format("2006-01-02T15:04:05.000Z07:00")
-	isoCache[seq] = cached
+	isoCache.Store(seq, cached)
 	return cached
 }
 
@@ -1737,10 +1738,8 @@ func (f *Forge) RepoJSON(repo *Repo) []byte {
 // IssueJSON renders an issue as JSON bytes. The result is cached per repo:
 // the read workload GETs the same issue 2,000 times with no writes between.
 func (f *Forge) IssueJSON(repo *Repo, issue *Issue) []byte {
-	if repo.issueCache != nil {
-		if cached, ok := repo.issueCache[issue.Number]; ok {
-			return cached
-		}
+	if cached, ok := repo.issueCache.Load(issue.Number); ok {
+		return cached.([]byte)
 	}
 	dst := make([]byte, 0, 320)
 	dst = append(dst, '{')
@@ -1789,10 +1788,7 @@ func (f *Forge) IssueJSON(repo *Repo, issue *Issue) []byte {
 	dst = appendJSONKey(dst, "updated_at")
 	dst = appendJSONString(dst, seqToISO(issue.UpdatedSeq))
 	dst = append(dst, '}')
-	if repo.issueCache == nil {
-		repo.issueCache = map[int][]byte{}
-	}
-	repo.issueCache[issue.Number] = dst
+	repo.issueCache.Store(issue.Number, dst)
 	return dst
 }
 

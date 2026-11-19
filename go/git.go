@@ -227,10 +227,8 @@ const receivePackCapabilities = "report-status side-band-64k delete-refs ofs-del
 // v0Advertisement is a v0 advertisement: `# service=...`, flush, ref lines
 // (capabilities after a NUL on the first), flush. Cached per repo; cleared on mutation.
 func v0Advertisement(repo *Repo, capabilities, service string) []byte {
-	if repo.adCache != nil {
-		if cached, ok := repo.adCache[service]; ok {
-			return cached
-		}
+	if cached, ok := repo.adCache.Load(service); ok {
+		return cached.([]byte)
 	}
 	var out []byte
 	out = append(out, pktText("# service="+service+"\n")...)
@@ -254,10 +252,7 @@ func v0Advertisement(repo *Repo, capabilities, service string) []byte {
 		}
 	}
 	out = append(out, pktFlushBytes...)
-	if repo.adCache == nil {
-		repo.adCache = map[string][]byte{}
-	}
-	repo.adCache[service] = out
+	repo.adCache.Store(service, out)
 	return out
 }
 
@@ -294,10 +289,8 @@ func handleInfoRefs(repo *Repo, service, gitProtocol string) (GitHTTPResponse, e
 // honouring peel/symrefs/ref-prefix. Cached per repo + args.
 func handleLsRefs(repo *Repo, args []string) []byte {
 	key := strings.Join(args, "\n")
-	if repo.lsCache != nil {
-		if cached, ok := repo.lsCache[key]; ok {
-			return cached
-		}
+	if cached, ok := repo.lsCache.Load(key); ok {
+		return cached.([]byte)
 	}
 	peel := false
 	symrefs := false
@@ -349,10 +342,7 @@ func handleLsRefs(repo *Repo, args []string) []byte {
 		out = append(out, pktText(line+"\n")...)
 	}
 	out = append(out, pktFlushBytes...)
-	if repo.lsCache == nil {
-		repo.lsCache = map[string][]byte{}
-	}
-	repo.lsCache[key] = out
+	repo.lsCache.Store(key, out)
 	return out
 }
 
@@ -515,10 +505,8 @@ func handleFetchV2(forge *Forge, repo *Repo, args []string) []byte {
 		keyBuf.WriteByte('0')
 	}
 	key := keyBuf.String()
-	if repo.fetchCache != nil {
-		if cached, ok := repo.fetchCache[key]; ok {
-			return cached
-		}
+	if cached, ok := repo.fetchCache.Load(key); ok {
+		return cached.([]byte)
 	}
 	plan := planFetch(forge, repo, parsed)
 	var out []byte
@@ -549,10 +537,7 @@ func handleFetchV2(forge *Forge, repo *Repo, args []string) []byte {
 		}
 	}
 	out = append(out, pktFlushBytes...)
-	if repo.fetchCache == nil {
-		repo.fetchCache = map[string][]byte{}
-	}
-	repo.fetchCache[key] = out
+	repo.fetchCache.Store(key, out)
 	return out
 }
 
