@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // GitHTTPError is an HTTP-level failure (malformed framing, unknown command):
@@ -587,6 +588,32 @@ func handleUploadPack(forge *Forge, repo *Repo, body []byte, gitProtocol string)
 		}
 		return GitHTTPResponse{Status: 200, ContentType: "application/x-git-upload-pack-result", Body: out}, nil
 	}
+	// Fast path: for unchanged repo state (every cache clears on mutation)
+	// the raw request body fully determines the answer, so it is a complete
+	// cache key — the clone workload's 50 identical ls-refs and 50 identical
+	// fetch bodies skip packet parsing and arg handling entirely. Anything
+	// the first packet does not prove to be ls-refs/fetch, and any cache
+	// miss, falls through to the full parse below, which also stores the
+	// result under the body key for the next identical request.
+	bodyKey := ""
+	if p, _, err := readPacket(body, 0); err == nil && p.kind == pktData {
+		cmdLine := strings.TrimRight(string(p.payload), " \t\n\r")
+		if cmd, ok := strings.CutPrefix(cmdLine, "command="); ok {
+			switch cmd {
+			case "fetch", "ls-refs":
+				bodyKey = "body:" + string(body)
+				var cache *sync.Map
+				if cmd == "fetch" {
+					cache = &repo.fetchCache
+				} else {
+					cache = &repo.lsCache
+				}
+				if cached, ok := cache.Load(bodyKey); ok {
+					return GitHTTPResponse{Status: 200, ContentType: "application/x-git-upload-pack-result", Body: cached.([]byte)}, nil
+				}
+			}
+		}
+	}
 	packets, err := parseAllPackets(body)
 	if err != nil {
 		return GitHTTPResponse{}, err
@@ -631,9 +658,17 @@ func handleUploadPack(forge *Forge, repo *Repo, body []byte, gitProtocol string)
 	}
 	switch command {
 	case "ls-refs":
-		return GitHTTPResponse{Status: 200, ContentType: "application/x-git-upload-pack-result", Body: handleLsRefs(repo, args)}, nil
+		out := handleLsRefs(repo, args)
+		if bodyKey != "" {
+			repo.lsCache.Store(bodyKey, out)
+		}
+		return GitHTTPResponse{Status: 200, ContentType: "application/x-git-upload-pack-result", Body: out}, nil
 	case "fetch":
-		return GitHTTPResponse{Status: 200, ContentType: "application/x-git-upload-pack-result", Body: handleFetchV2(forge, repo, args)}, nil
+		out := handleFetchV2(forge, repo, args)
+		if bodyKey != "" {
+			repo.fetchCache.Store(bodyKey, out)
+		}
+		return GitHTTPResponse{Status: 200, ContentType: "application/x-git-upload-pack-result", Body: out}, nil
 	default:
 		return GitHTTPResponse{}, &GitHTTPError{Status: 400, Message: fmt.Sprintf("unknown upload-pack command %q", command)}
 	}

@@ -32,6 +32,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -102,6 +104,13 @@ func waitForDone(client *http.Client, envURL string) {
 }
 
 func main() {
+	// The trial pod allows 2 CPUs and 1024 MiB. Go 1.24's default
+	// GOMAXPROCS counts the host's CPUs, not the cgroup limit, so a big
+	// host would oversubscribe the 2-CPU quota with spinning Ps and GC
+	// workers; pin it to the limit. Live data is a few tens of MB, so a
+	// higher GC percent trades idle heap for far fewer GC cycles.
+	runtime.GOMAXPROCS(2)
+	debug.SetGCPercent(200)
 	envURL := strings.TrimRight(os.Getenv("MAKEFUN_ENV_URL"), "/")
 	a := newApp()
 	if envURL == "" {

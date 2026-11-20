@@ -102,13 +102,20 @@ func (a *app) serve(ln net.Listener) {
 func (a *app) handleConn(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReaderSize(conn, 65536)
+	// outBuf is the response assembly buffer, reused across the requests of
+	// this connection (one goroutine owns it): the read workload's 2,000
+	// GETs on one keep-alive connection allocate no response buffer at all
+	// after the first warms it up.
+	var outBuf []byte
 	for {
 		req, keepAlive, err := readRequest(reader, conn)
 		if err != nil {
 			return
 		}
 		resp := a.handle(req)
-		if err := writeResponse(conn, req, resp, keepAlive); err != nil {
+		var werr error
+		outBuf, werr = writeResponse(conn, req, resp, keepAlive, outBuf)
+		if werr != nil {
 			return
 		}
 		if !keepAlive {
@@ -432,12 +439,16 @@ var statusTexts = map[int]string{
 }
 
 // writeResponse writes one response in a single Write call where possible.
-func writeResponse(conn net.Conn, req *httpRequest, resp httpResponse, keepAlive bool) error {
+// writeResponse serialises one response into buf (reused across requests on
+// the connection) and writes it in a single syscall. It returns the buffer to
+// reuse for the next response; an oversized buffer is dropped so one huge
+// response does not pin memory on the connection.
+func writeResponse(conn net.Conn, req *httpRequest, resp httpResponse, keepAlive bool, buf []byte) ([]byte, error) {
 	text, ok := statusTexts[resp.status]
 	if !ok {
 		text = "Status"
 	}
-	var out []byte
+	out := buf[:0]
 	out = append(out, "HTTP/1.1 "...)
 	out = strconv.AppendInt(out, int64(resp.status), 10)
 	out = append(out, ' ')
@@ -469,7 +480,10 @@ func writeResponse(conn net.Conn, req *httpRequest, resp httpResponse, keepAlive
 	out = append(out, "\r\n"...)
 	out = append(out, resp.body...)
 	_, err := conn.Write(out)
-	return err
+	if cap(out) > 1<<20 {
+		return nil, err
+	}
+	return out, err
 }
 
 // ---------------------------------------------------------------- routing helpers
@@ -873,6 +887,86 @@ func matchGitPath(pathname string) (string, string, string, bool) {
 	return owner, repoSeg[:len(repoSeg)-4], endpoint, true
 }
 
+// tryIssueFastPath serves GET /api/v3/repos/{o}/{r}/issues/{n} and POST
+// /api/v3/repos/{o}/{r}/issues/{n} without the generic route's segment split,
+// decode and (for creates) JSON parse. It returns fast=false for anything it
+// does not recognise, and the caller falls through to the generic route,
+// which re-derives the same answer. The generic route ignores the query
+// string on both endpoints, so the fast path does too; a '%' anywhere in the
+// repo path falls through because the generic route percent-decodes segments.
+func (a *app) tryIssueFastPath(req *httpRequest, pathname, requestID string) (bool, httpResponse) {
+	if req.method != "GET" && req.method != "POST" {
+		return false, httpResponse{}
+	}
+	const prefix = "/api/v3/repos/"
+	if !strings.HasPrefix(pathname, prefix) {
+		return false, httpResponse{}
+	}
+	rest := pathname[len(prefix):]
+	if strings.Contains(rest, "%") {
+		return false, httpResponse{}
+	}
+	slash1 := strings.IndexByte(rest, '/')
+	if slash1 <= 0 {
+		return false, httpResponse{}
+	}
+	owner := rest[:slash1]
+	rest = rest[slash1+1:]
+	slash2 := strings.IndexByte(rest, '/')
+	if slash2 <= 0 {
+		return false, httpResponse{}
+	}
+	repoName := rest[:slash2]
+	tail := rest[slash2+1:]
+	if req.method == "GET" {
+		if !strings.HasPrefix(tail, "issues/") {
+			return false, httpResponse{}
+		}
+		numStr := tail[len("issues/"):]
+		if numStr == "" || strings.Contains(numStr, "/") {
+			return false, httpResponse{}
+		}
+		number, ok := parsePathNumber(numStr)
+		if !ok {
+			return false, httpResponse{}
+		}
+		if !a.isAuthorized(req) {
+			return true, jsonMessage(401, "Bad credentials", requestID)
+		}
+		repo := a.forge.GetRepo(owner, repoName)
+		if repo == nil {
+			return true, notFoundResponse(requestID)
+		}
+		issue := repo.Issues[number]
+		if issue == nil {
+			return true, notFoundResponse(requestID)
+		}
+		return true, jsonResponse(200, a.forge.IssueJSON(repo, issue), requestID, oauthScopesHeader)
+	}
+	// POST: create an issue. Only the flat {title, body} shape takes the
+	// fast path; anything else (labels, other keys, malformed JSON) falls
+	// through to the generic route, which parses and validates it.
+	if tail != "issues" {
+		return false, httpResponse{}
+	}
+	title, bodyText, ok := extractIssueCreate(req.body)
+	if !ok {
+		return false, httpResponse{}
+	}
+	if !a.isAuthorized(req) {
+		return true, jsonMessage(401, "Bad credentials", requestID)
+	}
+	repo := a.forge.GetRepo(owner, repoName)
+	if repo == nil {
+		return true, notFoundResponse(requestID)
+	}
+	if title == "" {
+		return true, jsonMessage(422, "title is required", requestID)
+	}
+	issue := a.forge.CreateIssue(repo, title, bodyText, nil)
+	return true, jsonResponse(201, a.forge.IssueJSON(repo, issue), requestID, oauthScopesHeader)
+}
+
 // route dispatches one request (called under the app mutex).
 func (a *app) route(req *httpRequest, requestID string) httpResponse {
 	method := req.method
@@ -899,6 +993,17 @@ func (a *app) route(req *httpRequest, requestID string) httpResponse {
 			pathname = "/"
 		}
 	}
+
+	// Hot-path fast lanes: GET one issue (the read workload: 2,000 identical
+	// GETs) and POST one issue (the write workload: 200 creates) skip the
+	// generic segment split/decode and, for creates, the encoding/json body
+	// parse. Every response below is byte-identical to the generic route's;
+	// anything unusual (escapes, a query the generic path would honour, an
+	// unparseable body) falls through to it.
+	if fast, resp := a.tryIssueFastPath(req, pathname, requestID); fast {
+		return resp
+	}
+
 	query := &requestQuery{params: parseQueryParams(queryRaw), host: host, pathname: pathname}
 	var segments []string
 	for _, s := range strings.Split(pathname, "/") {

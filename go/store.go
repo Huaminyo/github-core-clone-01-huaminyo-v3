@@ -331,6 +331,19 @@ func (r *countingReader) Read(p []byte) (int, error) {
 	return 1, nil
 }
 
+// ReadByte lets compress/flate read the stream byte by byte directly: without
+// it flate wraps the reader in a bufio that refills (one Read call) per byte,
+// which measured 4.2x slower on a 1 KiB object (205 us vs 49 us). pos stays
+// exact either way, so the offset past the stream is unchanged.
+func (r *countingReader) ReadByte() (byte, error) {
+	if r.pos >= len(r.b) {
+		return 0, io.EOF
+	}
+	c := r.b[r.pos]
+	r.pos++
+	return c, nil
+}
+
 // zlibReaderPool reuses zlib readers (each holds a flate decompressor).
 var zlibReaderPool = sync.Pool{New: func() any {
 	zr, _ := zlib.NewReader(bytes.NewReader(nil))
@@ -528,7 +541,6 @@ func readPack(pack []byte, resolveBase ObjectLookup) (map[string]*GitObject, err
 	}
 
 	raw := make([]*rawEntry, 0, declaredCount)
-	byOffset := make(map[int]*rawEntry, declaredCount)
 	offset := 12
 	for index := 0; index < declaredCount; index++ {
 		entryOffset := offset
@@ -569,12 +581,38 @@ func readPack(pack []byte, resolveBase ObjectLookup) (map[string]*GitObject, err
 		entry.data = inflated
 		offset = nextOff
 		raw = append(raw, entry)
-		byOffset[entryOffset] = entry
 	}
 	if offset != trailerStart {
 		return nil, fmt.Errorf("pack has %d stray bytes before its trailer", trailerStart-offset)
 	}
 
+	// Fast path: packs without deltas (every benchmark push) need no
+	// resolution machinery — hash each entry directly. Identical result to
+	// the resolver below for delta-free packs (first object wins on a
+	// duplicate oid), minus three map allocations and the recursion.
+	hasDelta := false
+	for _, entry := range raw {
+		if entry.typeCode == 6 || entry.typeCode == 7 {
+			hasDelta = true
+			break
+		}
+	}
+	if !hasDelta {
+		objects := make(map[string]*GitObject, len(raw))
+		for _, entry := range raw {
+			typ := codeType[entry.typeCode]
+			oid := hashObject(typ, entry.data)
+			if _, ok := objects[oid]; !ok {
+				objects[oid] = &GitObject{Type: typ, Data: entry.data, Oid: oid}
+			}
+		}
+		return objects, nil
+	}
+
+	byOffset := make(map[int]*rawEntry, len(raw))
+	for _, entry := range raw {
+		byOffset[entry.offset] = entry
+	}
 	objects := make(map[string]*GitObject, len(raw))
 	resolving := make(map[int]bool)
 	resolvedByOid := make(map[string]*rawEntry)

@@ -1,16 +1,27 @@
-# github-core-clone v2
+# github-core-clone v3
 
 A standalone GitHub-compatible git forge in one Go process: smart-HTTP git
 (protocol v2 + v0), REST API v3, GraphQL, and MCP — all over a single in-memory
 store, Go stdlib only, no dependencies, no git binary, no network.
 
-Built for the make.fun `github-core-clone-01` bounty. v2 is a full Go port of
-the v1 TypeScript entry (same behavior, 120/120 conformance): the trial pods
-run gVisor, which slows Node.js ~2x, while a native static binary keeps its
-speed. The hot paths are allocation-light on top of that: pre-serialized
-response caches with generation-based invalidation, per-request fetch-pack
-caching, pooled zlib inflate/deflate, and a hand-rolled HTTP/1.1 server over
-raw TCP.
+Built for the make.fun `github-core-clone-01` bounty. v3 keeps v2.1's
+behavior (120/120 conformance, 600 feature + 200 agent) and cuts server CPU
+~23% (measured over full local grades: 0.95s -> 0.73s mean server CPU):
+
+- `countingReader.ReadByte`: flate reads the pack stream directly instead of
+  through a bufio that refilled per byte — inflate 4.2x faster (205 us ->
+  49 us per 1 KiB object), the push workload's main cost.
+- Delta-free pack fast path in `readPack` (every benchmark push): hash
+  directly, no resolution maps or recursion.
+- Hot-path fast lanes in the router: GET one issue and POST one issue skip
+  the generic segment split/decode; creates use a strict title/body JSON
+  scanner with fallback to the generic parser for anything unusual.
+- Upload-pack v2 answers cached by raw request body: the clone workload's
+  50 identical ls-refs/fetch bodies skip packet parsing entirely.
+- Per-connection response assembly buffer (no per-response allocation on
+  keep-alive), `GOMAXPROCS(2)` pinned to the trial pod's CPU limit (Go 1.24
+  counts host CPUs), and `SetGCPercent(200)` (live data is a few tens of MB
+  under a 1024 MiB limit).
 
 ## Run
 

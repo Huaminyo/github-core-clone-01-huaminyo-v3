@@ -9,6 +9,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // appendJSONString appends s as a JSON string literal (with quotes), escaping
@@ -68,6 +69,222 @@ func appendJSONBool(dst []byte, b bool) []byte {
 		return append(dst, "true"...)
 	}
 	return append(dst, "false"...)
+}
+
+// extractIssueCreate pulls title and body out of a POST /issues body that is
+// a flat JSON object whose values are all strings and whose keys are only
+// "title" and "body" (the shape the write workload sends). It is a strict
+// scanner, not a JSON parser: anything it cannot prove is that shape —
+// another key, a non-string value, a bad escape, invalid UTF-8, trailing
+// data — returns ok=false and the caller falls back to the generic
+// encoding/json parse, which decides the real answer (including the 400 for
+// malformed JSON). Duplicate keys resolve last-wins, like the generic map.
+func extractIssueCreate(data []byte) (title, body string, ok bool) {
+	i := 0
+	skipWS := func() {
+		for i < len(data) && (data[i] == ' ' || data[i] == '\t' || data[i] == '\n' || data[i] == '\r') {
+			i++
+		}
+	}
+	skipWS()
+	if i >= len(data) || data[i] != '{' {
+		return "", "", false
+	}
+	i++
+	skipWS()
+	if i < len(data) && data[i] == '}' {
+		i++
+		skipWS()
+		if i != len(data) {
+			return "", "", false
+		}
+		return "", "", true
+	}
+	for {
+		skipWS()
+		key, next, good := scanJSONString(data, i)
+		if !good {
+			return "", "", false
+		}
+		i = next
+		skipWS()
+		if i >= len(data) || data[i] != ':' {
+			return "", "", false
+		}
+		i++
+		skipWS()
+		value, next, good := scanJSONString(data, i)
+		if !good {
+			return "", "", false
+		}
+		i = next
+		switch key {
+		case "title":
+			title = value
+		case "body":
+			body = value
+		default:
+			return "", "", false
+		}
+		skipWS()
+		if i >= len(data) {
+			return "", "", false
+		}
+		if data[i] == ',' {
+			i++
+			continue
+		}
+		if data[i] == '}' {
+			i++
+			skipWS()
+			if i != len(data) {
+				return "", "", false
+			}
+			return title, body, true
+		}
+		return "", "", false
+	}
+}
+
+// scanJSONString parses one JSON string literal starting at data[i] == '"'
+// and returns its unescaped value and the offset just past the closing quote.
+// ok=false on any malformed input (unterminated string, bad escape, a raw
+// control character, invalid UTF-8 — the generic parser replaces that with
+// U+FFFD, so the fast path declines it instead of diverging).
+func scanJSONString(data []byte, i int) (string, int, bool) {
+	if i >= len(data) || data[i] != '"' {
+		return "", 0, false
+	}
+	i++
+	start := i
+	// Fast lane: no escape in the string.
+	for i < len(data) {
+		c := data[i]
+		if c == '"' {
+			s := string(data[start:i])
+			if !utf8.ValidString(s) {
+				return "", 0, false
+			}
+			return s, i + 1, true
+		}
+		if c == '\\' {
+			break
+		}
+		if c < 0x20 {
+			return "", 0, false
+		}
+		i++
+	}
+	if i >= len(data) {
+		return "", 0, false
+	}
+	// Slow lane: at least one escape; rebuild the value.
+	out := make([]byte, 0, 64)
+	out = append(out, data[start:i]...)
+	for i < len(data) {
+		c := data[i]
+		if c == '"' {
+			s := string(out)
+			if !utf8.ValidString(s) {
+				return "", 0, false
+			}
+			return s, i + 1, true
+		}
+		if c < 0x20 {
+			return "", 0, false
+		}
+		if c != '\\' {
+			out = append(out, c)
+			i++
+			continue
+		}
+		i++
+		if i >= len(data) {
+			return "", 0, false
+		}
+		switch data[i] {
+		case '"':
+			out = append(out, '"')
+			i++
+		case '\\':
+			out = append(out, '\\')
+			i++
+		case '/':
+			out = append(out, '/')
+			i++
+		case 'b':
+			out = append(out, '\b')
+			i++
+		case 'f':
+			out = append(out, '\f')
+			i++
+		case 'n':
+			out = append(out, '\n')
+			i++
+		case 'r':
+			out = append(out, '\r')
+			i++
+		case 't':
+			out = append(out, '\t')
+			i++
+		case 'u':
+			r, next, good := scanUnicodeEscape(data, i+1)
+			if !good {
+				return "", 0, false
+			}
+			out = utf8.AppendRune(out, r)
+			i = next
+		default:
+			return "", 0, false
+		}
+	}
+	return "", 0, false
+}
+
+// scanUnicodeEscape decodes \uXXXX at data[i] (i points just past the 'u'),
+// combining a surrogate pair when one follows. A lone surrogate decodes to
+// U+FFFD, matching encoding/json.
+func scanUnicodeEscape(data []byte, i int) (rune, int, bool) {
+	hex4 := func(j int) (int, bool) {
+		if j+4 > len(data) {
+			return 0, false
+		}
+		v := 0
+		for k := 0; k < 4; k++ {
+			c := data[j+k]
+			v <<= 4
+			switch {
+			case c >= '0' && c <= '9':
+				v |= int(c - '0')
+			case c >= 'a' && c <= 'f':
+				v |= int(c-'a') + 10
+			case c >= 'A' && c <= 'F':
+				v |= int(c-'A') + 10
+			default:
+				return 0, false
+			}
+		}
+		return v, true
+	}
+	v, ok := hex4(i)
+	if !ok {
+		return 0, 0, false
+	}
+	i += 4
+	if v >= 0xD800 && v <= 0xDBFF {
+		// High surrogate: a following \uDC00-\uDFFF completes the pair.
+		if i+6 <= len(data) && data[i] == '\\' && data[i+1] == 'u' {
+			lo, ok := hex4(i + 2)
+			if ok && lo >= 0xDC00 && lo <= 0xDFFF {
+				return 0x10000 + rune(v-0xD800)<<10 + rune(lo-0xDC00), i + 6, true
+			}
+		}
+		return utf8.RuneError, i, true
+	}
+	if v >= 0xDC00 && v <= 0xDFFF {
+		return utf8.RuneError, i, true
+	}
+	return rune(v), i, true
 }
 
 // marshalJSON is encoding/json for the cold paths (GraphQL, MCP). Map keys
